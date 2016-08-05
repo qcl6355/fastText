@@ -225,8 +225,8 @@ void Predict(Sentence *sen, float &prob) {
         if (wid == -1) continue;
         total++;
         for (a = 0; a < layer1_size; a++) neu1[a] += syn0[a + wid * layer1_size];
-        for (a = 0; a < layer1_size; a++) neu1[a] /= total;
     }
+    for (a = 0; a < layer1_size; a++) neu1[a] /= total;
 
     real pmax = -1.0;
     char label[MAX_STRING];

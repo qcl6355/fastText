@@ -49,9 +49,6 @@ real alpha = 0.025, starting_alpha, sample = 0;
 real *syn0, *syn1, *expTable;
 clock_t start;
 
-const int table_size = 1e8;
-int *table;
-
 struct Sentence {
     vector<string> words_;
     string label_;
@@ -339,7 +336,7 @@ void LearnVocabFromTrainFile() {
 
     if (debug_mode > 0) {
         fprintf(stderr, "Category size: %lld\n", category_size);
-        fprintf(stderr, "Read [%lld] Sentences\n", docs.size());
+        fprintf(stderr, "Read [%ld] Sentences\n", docs.size());
         fprintf(stderr, "Vocab contains [%lld] words\n", vocab_size);
     }
 
@@ -347,16 +344,9 @@ void LearnVocabFromTrainFile() {
 }
 
 void SaveVocab() {
-    /*long long i;
-    FILE *fo = fopen(save_vocab_file, "wb");
-    for (i = 0; i < vocab_hash_size; i++) {
-        fprintf(fo, "%s %lld\n", vocab[i].word, vocab[i].cn);
-    }
-    fclose(fo);*/
 }
 
 void ReadVocab() {
-
 }
 
 void InitNet() {
@@ -418,7 +408,7 @@ void *TrainModelThread(void *id) {
     long long part_begin = (long long) num_threads * (long long) id;
 
     for (size_t i = 0; i < docs.size(); ++i) {
-        if ((i + 1) % 10000 == 0) fprintf(stderr, "processed %lld sentences.\n", i+1);
+        if ((i + 1) % 10000 == 0) fprintf(stderr, "processed %ld sentences.\n", i+1);
         Sentence *sen = docs[i];
         for (c = 0; c < layer1_size; c++) neu1[c] = 0;
         for (c = 0; c < layer1_size; c++) neu1e[c] = 0;
@@ -429,8 +419,8 @@ void *TrainModelThread(void *id) {
             if (last_word == -1) continue;
             total++;
             for (c = 0; c < layer1_size; c++) neu1[c] += syn0[c + last_word * layer1_size];
-            for (c = 0; c < layer1_size; c++) neu1[c] /= total;  // average
         }
+        for (c = 0; c < layer1_size; c++) neu1[c] /= total;  // average
 
         last_label = SearchLabel(sen->label_.c_str());
 
@@ -446,19 +436,22 @@ void *TrainModelThread(void *id) {
             // Propagate hidden -> output
             for (c = 0; c < layer1_size; c++) f += neu1[c] * syn1[c + l2];
 
-            if (f <= -MAX_EXP || f >= MAX_EXP) {
-              continue;
+            if (f <= -MAX_EXP){
+                f = -1.0;
+            } else if (f >= MAX_EXP) {
+                f = 1.0;
             } else {
               f = expTable[(int) ((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))];
             }
 
             // 'g' is the gradient multiplied by the learning rate.
-            g = (1 - category[last_label].code[d] - f) * alpha;
+            g = (category[last_label].code[d] - f) * alpha;
             // Propagate errors output -> hidden.
             for (c = 0; c < layer1_size; c++) neu1e[c] += g * syn1[c + l2];
             // Learn weights hidden->output
             for (c = 0; c < layer1_size; c++) syn1[c + l2] += g * neu1[c];
         }
+        for (c = 0; c < layer1_size; c++) neu1e[c] /= total;
         // Hidden -> input
         for (size_t j = 0; j < sen->words_.size(); ++j) {
             last_word = SearchVocab(sen->words_[j].c_str());
@@ -554,7 +547,6 @@ void TrainModel() {
     }
 
     fclose(fo);
-    free(table);
     free(pt);
     DestroyCategory();
     DestroyVocab();
@@ -575,19 +567,15 @@ int ArgPos(const char *str, int argc, char **argv) {
 }
 
 void Usage() {
-    printf("WORD VECTOR estimation toolkit v 0.1b\n\n");
+    printf("fastText toolkit v0.99\n\n");
     printf("Options:\n");
     printf("Parameters for training:\n");
     printf("\t-train <file>\n");
     printf("\t\tUse text data from <file> to train the model\n");
     printf("\t-output <file>\n");
-    printf("\t\tUse <file> to save the resulting word vectors / word clusters\n");
+    printf("\t\tUse <file> to save the model\n");
     printf("\t-size <int>\n");
     printf("\t\tSet size of word vectors; default is 100\n");
-    printf("\t-sample <float>\n");
-    printf("\t\tSet threshold for occurrence of words. Those that appear with higher frequency");
-    printf(" in the training data will be randomly down-sampled; default is 0 (off), useful value is 1e-5\n");
-    printf("\t-hs <int>\n");
     printf("\t-threads <int>\n");
     printf("\t\tUse <int> threads (default 1)\n");
     printf("\t-min-count <int>\n");
@@ -597,14 +585,9 @@ void Usage() {
     printf("\t-debug <int>\n");
     printf("\t\tSet the debug mode (default = 2 = more info during training)\n");
     printf("\t-binary <int>\n");
-    printf("\t\tSave the resulting vectors in binary moded; default is0 (off)\n");
-    printf("\t-save-vocab <file>\n");
-    printf("\t\tThe vocabulary will be saved to <file>\n");
-    printf("\t-read-vocab <file>\n");
-    printf("\t\tThe vocabulary will be read from <file>, not constructed from the training data\n");
+    printf("\t\tSave the resulting vectors in binary moded; default is 0 (off)\n");
     printf("\nExamples:\n");
-    printf("./word2vec -train data.txt -output vec.txt -debug 2 -size 200 "
-                   "-window 5 -sample 1e-4 -negative 5 -hs 0 -binary 0 -cbow 1\n\n");
+    printf("./doc2label -train data.txt -output model -debug 2 -size 200 \n\n");
 }
 
 int main(int argc, char **argv) {
