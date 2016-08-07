@@ -11,8 +11,9 @@
 using namespace std;
 
 #define MAX_STRING 100
-#define EXP_TABLE_SIZE 1000
-#define MAX_EXP 6
+#define EXP_TABLE_SIZE 512
+#define LOG_TABLE_SIZE 512
+#define MAX_EXP 8
 #define MAX_SENTENCE_LENGTH 1000
 #define MAX_CODE_LENGTH 40
 
@@ -29,8 +30,6 @@ struct node {
     int id;
     struct node *left;
     struct node *right;
-    real prod_prob;
-    real inner_prob;
 };
 struct node* huffman_tree;
 
@@ -47,9 +46,7 @@ struct vocab_word {
 int *vocab_hash; // Hash table.
 struct vocab_word *vocab;
 long long vocab_size = 0, category_size = 0, layer1_size = 10;
-real *syn0, *syn1, *expTable;
-const int table_size = 1e8;
-int *table;
+real *syn0, *syn1, *expTable, *logTable;
 
 void Split(const string &s, const char *delims, vector<string> &res) {
     int ind_sep = s.find(delims);
@@ -74,6 +71,11 @@ int ArgPos(const char *str, int argc, char **argv) {
         }
     }
     return -1;  // Not found.
+}
+
+real getLog(real x) {
+    if (x > 1.0 ) return 0.0;
+    return logTable[(int) (x * LOG_TABLE_SIZE)];
 }
 
 void BuildTree(const string &label, const string &code, const string &point) {
@@ -102,8 +104,6 @@ void BuildTree(const string &label, const string &code, const string &point) {
             cursor->id = -1;
             cursor->left = NULL;
             cursor->right = NULL;
-            cursor->inner_prob = 0.0;
-            cursor->prod_prob = 1.0;
             total_nodes++;
         }
 
@@ -154,42 +154,29 @@ void PreOrder(struct node *sub, vector<int> &code, vector<int> &parent) {
     }
 }
 
-void PreOrderCompute(struct node *sub, real *neu1, real &max_prob, char *label) {
-    if (sub != NULL) {
-        if (sub->left == NULL && sub->right == NULL) {  // leaf node.
-            if (sub->prod_prob > max_prob) {
-                max_prob = sub->prod_prob;
-                strcpy(label, sub->name);
-                // cout << "update:" << max_prob << "|" << label << endl;
-            }
-        } else {  // internal node.
-            real f = 0.0;
-            for (long long a = 0; a < layer1_size; a++) {
-                f = neu1[a] * syn1[a + sub->id * layer1_size];
-            }
-            if (f >= MAX_EXP) {
-                f = 1.0;
-            } else if (f <= -MAX_EXP) {
-                f = 0.0;
-            } else {
-                f = expTable[(int) ((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))];
-            }
-            sub->inner_prob = f;
-
-            // cout << "sub:" << sub->id << " prod_prob: " << sub->prod_prob <<" f: " << f << "|max_prob: " << max_prob << endl;
-        }
-
-        if (sub->left != NULL && sub->prod_prob > max_prob) {
-            sub->left->prod_prob = sub->prod_prob * (1 - sub->inner_prob);
-            PreOrderCompute(sub->left, neu1, max_prob, label);
-        }
-
-        if (sub->right != NULL && sub->prod_prob > max_prob) {
-            sub->right->prod_prob = sub->prod_prob * sub->inner_prob;
-            PreOrderCompute(sub->right, neu1, max_prob, label);
-        }
-
+void PreOrderCompute(struct node *sub, real *neu1, real &max_prob, real score, char *label) {
+    if (score < max_prob) return;
+    if (sub->left == NULL && sub->right == NULL) {  // leaf node.
+        max_prob = score;
+        strcpy(label, sub->name);
+        return;
     }
+
+    real f = 0.0;
+    for (long long a = 0; a < layer1_size; a++) {
+        f += neu1[a] * syn1[a + sub->id * layer1_size];
+    }
+
+    if (f >= MAX_EXP) {
+        f = 1.0;
+    } else if (f <= -MAX_EXP) {
+        f = 0.0;
+    } else {
+        f = expTable[(int) ((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))];
+    }
+    
+    PreOrderCompute(sub->left, neu1, max_prob, score + getLog(1 - f), label);
+    PreOrderCompute(sub->right, neu1, max_prob, score + getLog(f), label);
 }
 
 // Returns hash value of a word
@@ -220,18 +207,18 @@ void Predict(Sentence *sen, float &prob) {
     for (a = 0; a < layer1_size; a++) neu1[a] = 0;
 
     int total = 0;
-    for (size_t i = 0; i < sen->words_.size(); ++i) {
+    for (size_t i = 1; i < sen->words_.size(); ++i) {
         wid = SearchVocab(sen->words_[i].c_str());
         if (wid == -1) continue;
         total++;
         for (a = 0; a < layer1_size; a++) neu1[a] += syn0[a + wid * layer1_size];
     }
     for (a = 0; a < layer1_size; a++) neu1[a] /= total;
-
-    real pmax = -1.0;
+    
+    real pmax = -1e10;
     char label[MAX_STRING];
-    huffman_tree->prod_prob = 1.0;
-    PreOrderCompute(huffman_tree, neu1, pmax, label);
+    real score = 0.0;
+    PreOrderCompute(huffman_tree, neu1, pmax, score, label);
     prob = pmax;
     sen->label_ = string(label);
 }
@@ -313,8 +300,13 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
     for (i = 0; i < EXP_TABLE_SIZE; i++) {
-        expTable[i] = exp((i / (real) EXP_TABLE_SIZE * 2 - 1) * MAX_EXP);  // Precompute the exp() table.
-        expTable[i] = expTable[i] / (expTable[i] + 1);  // Precompute f(x) = x / (x + 1).
+        real x = real(i * 2 * MAX_EXP) / EXP_TABLE_SIZE - MAX_EXP;
+        expTable[i] = 1.0 / (1.0 + exp(-x));
+    }
+    logTable = (real *) malloc((EXP_TABLE_SIZE + 1) * sizeof(real));
+    for (i = 0; i < LOG_TABLE_SIZE; i++) {
+        real x = (real(i) + 1e-5) / LOG_TABLE_SIZE;
+        logTable[i] = log(x);
     }
 
     total_nodes = 1;
@@ -343,13 +335,14 @@ int main(int argc, char *argv[]) {
         Sentence *sen = new Sentence();
         Split(line, " ", sen->words_);
         Predict(sen, prob);
-        cout << sen->label_ << "|" << prob << endl;
+        cout << sen->label_ << endl;
         delete sen;
     }
 
     fin.close();
 
     free(expTable);
+    free(logTable);
     return 0;
 }
 

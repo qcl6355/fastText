@@ -15,8 +15,8 @@
 using namespace std;
 
 #define MAX_STRING 100
-#define EXP_TABLE_SIZE 1000
-#define MAX_EXP 6
+#define EXP_TABLE_SIZE 512
+#define MAX_EXP 8
 #define MAX_SENTENCE_LENGTH 1000
 #define MAX_CODE_LENGTH 40
 
@@ -40,11 +40,11 @@ struct vocab_word {
 
 char train_file[MAX_STRING], output_file[MAX_STRING];
 char save_vocab_file[MAX_STRING], read_vocab_file[MAX_STRING];
-int binary = 0, debug_mode = 2, min_count = 0, num_threads = 1, min_reduce = 1;
+int binary = 0, debug_mode = 2, min_count = 1, num_threads = 1, min_reduce = 1;
 int *vocab_hash;  // Hash table.
 struct vocab_word *vocab;  // Word vocabulary
 long long vocab_max_size = 1000, vocab_size = 0, layer1_size = 10;
-real alpha = 0.025, starting_alpha, sample = 0;
+real alpha = 0.1, starting_alpha, sample = 0;
 // syn0 => input document, syn1 => vitural label in the huffman tree.
 real *syn0, *syn1, *expTable;
 clock_t start;
@@ -52,6 +52,7 @@ clock_t start;
 struct Sentence {
     vector<string> words_;
     string label_;
+    int size() { return words_.size(); }
 };
 vector<Sentence *> docs;
 
@@ -60,6 +61,8 @@ int *category_hash; // Label hash table.
 long long category_size = 0, category_max_size = 1000;
 
 char ctrl_a = 1;  // Character ctrl-a
+int epoch = 5;  // iteration number
+real MIN_LR = 0.000001;
 
 //----------------------------------------------------
 void InitUnigramTable() {
@@ -86,7 +89,7 @@ void ReadLabelInstance(const string &text, Sentence *sen) {
 }
 
 // Returns hash value of a word
-int GetWordHash(string word) {
+int GetWordHash(const string &word) {
     unsigned long long a, hash = 0;
     for (a = 0; a < word.size(); a++) {
         hash = hash * 257 + word[a];
@@ -336,7 +339,7 @@ void LearnVocabFromTrainFile() {
 
     if (debug_mode > 0) {
         fprintf(stderr, "Category size: %lld\n", category_size);
-        fprintf(stderr, "Read [%ld] Sentences\n", docs.size());
+        fprintf(stderr, "Read [%lld] Sentences\n", docs.size());
         fprintf(stderr, "Vocab contains [%lld] words\n", vocab_size);
     }
 
@@ -344,9 +347,16 @@ void LearnVocabFromTrainFile() {
 }
 
 void SaveVocab() {
+    /*long long i;
+    FILE *fo = fopen(save_vocab_file, "wb");
+    for (i = 0; i < vocab_hash_size; i++) {
+        fprintf(fo, "%s %lld\n", vocab[i].word, vocab[i].cn);
+    }
+    fclose(fo);*/
 }
 
 void ReadVocab() {
+
 }
 
 void InitNet() {
@@ -404,60 +414,76 @@ void *TrainModelThread(void *id) {
     // neu1 is hidden units, neu1e is hidden resual error.
     real *neu1 = (real *) calloc(layer1_size, sizeof(real));
     real *neu1e = (real *) calloc(layer1_size, sizeof(real));
+    
+    long long ntokens = 0;
+    for (size_t i = 0; i < docs.size(); ++i) ntokens += docs[i]->size();
 
-    long long part_begin = (long long) num_threads * (long long) id;
+    // long long part_begin = (long long) num_threads * (long long) id;
 
-    for (size_t i = 0; i < docs.size(); ++i) {
-        if ((i + 1) % 10000 == 0) fprintf(stderr, "processed %ld sentences.\n", i+1);
-        Sentence *sen = docs[i];
-        for (c = 0; c < layer1_size; c++) neu1[c] = 0;
-        for (c = 0; c < layer1_size; c++) neu1e[c] = 0;
+    for (size_t iter = 0; iter < epoch; ++iter) {
+        for (size_t i = 0; i < docs.size(); ++i) {
+            Sentence *sen = docs[i];
+            word_count += sen->size();
+            if (word_count % 100000 == 0) { // decay learning rate.
+                real progress = (real) word_count / (ntokens * epoch);
+                alpha = alpha * (1.0 - progress);
+                if (alpha < MIN_LR) alpha = MIN_LR;
+                fprintf(stderr, "processed %lld words, lr:%.6f\n", word_count, alpha);
+            }
+            for (c = 0; c < layer1_size; c++) neu1[c] = 0;
+            for (c = 0; c < layer1_size; c++) neu1e[c] = 0;
 
-        int total = 0;
-        for (size_t j = 0; j < sen->words_.size(); ++j) {
-            last_word = SearchVocab(sen->words_[j].c_str());
-            if (last_word == -1) continue;
-            total++;
-            for (c = 0; c < layer1_size; c++) neu1[c] += syn0[c + last_word * layer1_size];
-        }
-        for (c = 0; c < layer1_size; c++) neu1[c] /= total;  // average
+            int total = 0;
+            for (size_t j = 0; j < sen->words_.size(); ++j) {
+                last_word = SearchVocab(sen->words_[j].c_str());
+                if (last_word != -1) {
+                    total++;
+                    for (c = 0; c < layer1_size; c++) {
+                        neu1[c] += syn0[c + last_word * layer1_size];
+                    }
+                }
+            }
+            for (c = 0; c < layer1_size; c++) neu1[c] /= total;  // average
+        
+            last_label = SearchLabel(sen->label_.c_str());
 
-        last_label = SearchLabel(sen->label_.c_str());
-
-        if (last_label == -1) {
-            cerr << "low frequent label:" << sen->label_ <<endl;
-            continue;
-        }
-
-        // hs optimization
-        for (d = 0; d < category[last_label].codelen; d++) {
-            f = 0;
-            l2 = category[last_label].point[d] * layer1_size;  // parent nodes in the Huffman tree.
-            // Propagate hidden -> output
-            for (c = 0; c < layer1_size; c++) f += neu1[c] * syn1[c + l2];
-
-            if (f <= -MAX_EXP){
-                f = -1.0;
-            } else if (f >= MAX_EXP) {
-                f = 1.0;
-            } else {
-              f = expTable[(int) ((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))];
+            if (last_label == -1) {
+                cerr << "low frequent label:" << sen->label_ <<endl;
+                continue;
             }
 
-            // 'g' is the gradient multiplied by the learning rate.
-            g = (category[last_label].code[d] - f) * alpha;
-            // Propagate errors output -> hidden.
-            for (c = 0; c < layer1_size; c++) neu1e[c] += g * syn1[c + l2];
-            // Learn weights hidden->output
-            for (c = 0; c < layer1_size; c++) syn1[c + l2] += g * neu1[c];
-        }
-        for (c = 0; c < layer1_size; c++) neu1e[c] /= total;
-        // Hidden -> input
-        for (size_t j = 0; j < sen->words_.size(); ++j) {
-            last_word = SearchVocab(sen->words_[j].c_str());
-            if (last_word == -1) continue;
-            for (c = 0; c < layer1_size; c++) {
-                syn0[c + last_word * layer1_size] += neu1e[c];
+            // hs optimization
+            for (d = 0; d < category[last_label].codelen; d++) {
+                f = 0;
+                l2 = category[last_label].point[d] * layer1_size;  // parent nodes in the Huffman tree.
+                // Propagate hidden -> output
+                for (c = 0; c < layer1_size; c++) f += neu1[c] * syn1[c + l2];
+
+                if (f <= -MAX_EXP ) {
+                    f = 0.0;
+                } else if (f >= MAX_EXP) {
+                    f = 1.0;
+                } else {
+                  f = expTable[(int) ((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))];
+                }
+
+                // 'g' is the gradient multiplied by the learning rate.
+                g = (category[last_label].code[d] - f) * alpha;
+                // Propagate errors output -> hidden.
+                for (c = 0; c < layer1_size; c++) neu1e[c] += g * syn1[c + l2];
+                // Learn weights hidden->output
+                for (c = 0; c < layer1_size; c++) syn1[c + l2] += g * neu1[c];
+            }
+
+            for (c = 0; c < layer1_size; c++) neu1e[c] /= total;
+
+            // Hidden -> input
+            for (size_t j = 0; j < sen->words_.size(); ++j) {
+                last_word = SearchVocab(sen->words_[j].c_str());
+                if (last_word == -1) continue;
+                for (c = 0; c < layer1_size; c++) {
+                    syn0[c + last_word * layer1_size] += neu1e[c];
+                }
             }
         }
     }
@@ -567,15 +593,19 @@ int ArgPos(const char *str, int argc, char **argv) {
 }
 
 void Usage() {
-    printf("fastText toolkit v0.99\n\n");
+    printf("WORD VECTOR estimation toolkit v 0.1b\n\n");
     printf("Options:\n");
     printf("Parameters for training:\n");
     printf("\t-train <file>\n");
     printf("\t\tUse text data from <file> to train the model\n");
     printf("\t-output <file>\n");
-    printf("\t\tUse <file> to save the model\n");
+    printf("\t\tUse <file> to save the resulting word vectors / word clusters\n");
     printf("\t-size <int>\n");
     printf("\t\tSet size of word vectors; default is 100\n");
+    printf("\t-sample <float>\n");
+    printf("\t\tSet threshold for occurrence of words. Those that appear with higher frequency");
+    printf(" in the training data will be randomly down-sampled; default is 0 (off), useful value is 1e-5\n");
+    printf("\t-hs <int>\n");
     printf("\t-threads <int>\n");
     printf("\t\tUse <int> threads (default 1)\n");
     printf("\t-min-count <int>\n");
@@ -585,9 +615,14 @@ void Usage() {
     printf("\t-debug <int>\n");
     printf("\t\tSet the debug mode (default = 2 = more info during training)\n");
     printf("\t-binary <int>\n");
-    printf("\t\tSave the resulting vectors in binary moded; default is 0 (off)\n");
+    printf("\t\tSave the resulting vectors in binary moded; default is0 (off)\n");
+    printf("\t-save-vocab <file>\n");
+    printf("\t\tThe vocabulary will be saved to <file>\n");
+    printf("\t-read-vocab <file>\n");
+    printf("\t\tThe vocabulary will be read from <file>, not constructed from the training data\n");
     printf("\nExamples:\n");
-    printf("./doc2label -train data.txt -output model -debug 2 -size 200 \n\n");
+    printf("./word2vec -train data.txt -output vec.txt -debug 2 -size 200 "
+                   "-window 5 -sample 1e-4 -negative 5 -hs 0 -binary 0 -cbow 1\n\n");
 }
 
 int main(int argc, char **argv) {
@@ -615,8 +650,8 @@ int main(int argc, char **argv) {
         exit(1);
     }
     for (i = 0; i < EXP_TABLE_SIZE; i++) {
-        expTable[i] = exp((i / (real) EXP_TABLE_SIZE * 2 - 1) * MAX_EXP);  // Precompute the exp() table.
-        expTable[i] = expTable[i] / (expTable[i] + 1);  // Precompute f(x) = x / (x + 1).
+        real x = real(i * 2 * MAX_EXP) / EXP_TABLE_SIZE - MAX_EXP;
+        expTable[i] = 1.0 / (1.0 + exp(-x));
     }
     TrainModel();
     DestroyNet();
