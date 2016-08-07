@@ -11,9 +11,9 @@
 using namespace std;
 
 #define MAX_STRING 100
-#define EXP_TABLE_SIZE 512
-#define LOG_TABLE_SIZE 512
-#define MAX_EXP 8
+#define EXP_TABLE_SIZE 1000
+#define LOG_TABLE_SIZE 1000
+#define MAX_EXP 6
 #define MAX_SENTENCE_LENGTH 1000
 #define MAX_CODE_LENGTH 40
 
@@ -35,7 +35,10 @@ struct node* huffman_tree;
 
 struct Sentence {
     vector<string> words_;
+    vector<string> ngrams_;
+    vector<int32_t> features_;
     string label_;
+    int size() { return features_.size(); }
 };
 
 struct vocab_word {
@@ -47,6 +50,7 @@ int *vocab_hash; // Hash table.
 struct vocab_word *vocab;
 long long vocab_size = 0, category_size = 0, layer1_size = 10;
 real *syn0, *syn1, *expTable, *logTable;
+int ngram = 2;
 
 void Split(const string &s, const char *delims, vector<string> &res) {
     int ind_sep = s.find(delims);
@@ -77,6 +81,18 @@ real getLog(real x) {
     if (x > 1.0 ) return 0.0;
     return logTable[(int) (x * LOG_TABLE_SIZE)];
 }
+
+void AddNGrams(Sentence *sen, int32_t ngram) {
+    for (size_t i = 0; i < sen->words_.size() - ngram + 1; ++i) {
+        string gram = "<-";
+        for (int j = 0; j < ngram; ++j) {
+            gram += sen->words_[i+j] + "-";
+        }
+        gram += ">";
+        sen->ngrams_.push_back(gram);
+    }
+}
+
 
 void BuildTree(const string &label, const string &code, const string &point) {
     vector<string> points;
@@ -156,6 +172,7 @@ void PreOrder(struct node *sub, vector<int> &code, vector<int> &parent) {
 
 void PreOrderCompute(struct node *sub, real *neu1, real &max_prob, real score, char *label) {
     if (score < max_prob) return;
+    fprintf(stderr, "node:%d\n", sub->id);
     if (sub->left == NULL && sub->right == NULL) {  // leaf node.
         max_prob = score;
         strcpy(label, sub->name);
@@ -213,6 +230,13 @@ void Predict(Sentence *sen, float &prob) {
         total++;
         for (a = 0; a < layer1_size; a++) neu1[a] += syn0[a + wid * layer1_size];
     }
+    AddNGrams(sen, ngram);
+    for (size_t i = 0; i < sen->ngrams_.size(); ++i) {
+        wid = SearchVocab(sen->ngrams_[i].c_str());
+        if (wid == -1) continue;
+        total++;
+        for (a = 0; a < layer1_size; a++) neu1[a] += syn0[a + wid * layer1_size];
+    }
     for (a = 0; a < layer1_size; a++) neu1[a] /= total;
     
     real pmax = -1e10;
@@ -221,6 +245,7 @@ void Predict(Sentence *sen, float &prob) {
     PreOrderCompute(huffman_tree, neu1, pmax, score, label);
     prob = pmax;
     sen->label_ = string(label);
+    fprintf(stderr, "\n");
 }
 
 int AddWordToVocab(const char *word, int idx) {
@@ -234,8 +259,9 @@ int AddWordToVocab(const char *word, int idx) {
     return idx;
 }
 
+
 void LoadModel() {
-    long long a, c;
+    long long c;
     ifstream fin(model_file);
     if (!fin.is_open()) {
         fprintf(stderr, "open file [%s] failed.\n", model_file);
@@ -247,15 +273,15 @@ void LoadModel() {
     vocab = (struct vocab_word *) calloc(vocab_size, sizeof(struct vocab_word));
     vocab_hash = (int *) calloc(vocab_hash_size, sizeof(int));
     for (c = 0; c < vocab_hash_size; c++) vocab_hash[c] = -1;
-    a = posix_memalign((void **) &syn0, 128,
+    posix_memalign((void **) &syn0, 128,
                     vocab_size * layer1_size * sizeof(real));
 
-    a = posix_memalign((void **) &syn1, 128,
+    posix_memalign((void **) &syn1, 128,
                     category_size * layer1_size * sizeof(real));
     // Init vocab table.
     fprintf(stderr, "loading vocabulary vectors...\n");
     vector<string> token;
-    for (size_t i = 0; i < vocab_size; i++) {
+    for (long long i = 0; i < vocab_size; i++) {
         getline(fin, line);
         token.clear();
         Split(line, " ", token);
@@ -266,7 +292,7 @@ void LoadModel() {
     }
     fprintf(stderr, "loading virtual category vectors...\n");
     // category weights.
-    for (size_t i = 0; i < category_size; i++) {
+    for (long long i = 0; i < category_size; i++) {
         getline(fin, line);
         token.clear();
         Split(line, " ", token);
@@ -276,7 +302,7 @@ void LoadModel() {
     }
     fprintf(stderr, "loading category code & point...\n");
     // category huffman code.
-    for (size_t i = 0; i < category_size; i++) {
+    for (long long i = 0; i < category_size; i++) {
         getline(fin, line);
         int idx1 = line.find(' ');
         string label = line.substr(0, idx1);
@@ -320,9 +346,6 @@ int main(int argc, char *argv[]) {
 
     LoadModel();
 
-    /*vector<int> code;
-    vector<int> parent;
-    PreOrder(huffman_tree, code, parent);*/
     ifstream fin(test_file);
     if (!fin.is_open()) {
         cerr << "open " << test_file << " failed." << endl;

@@ -15,8 +15,8 @@
 using namespace std;
 
 #define MAX_STRING 100
-#define EXP_TABLE_SIZE 512
-#define MAX_EXP 8
+#define EXP_TABLE_SIZE 1000
+#define MAX_EXP 6
 #define MAX_SENTENCE_LENGTH 1000
 #define MAX_CODE_LENGTH 40
 
@@ -49,10 +49,13 @@ real alpha = 0.1, starting_alpha, sample = 0;
 real *syn0, *syn1, *expTable;
 clock_t start;
 
+
 struct Sentence {
     vector<string> words_;
+    vector<string> ngrams_;
     string label_;
-    int size() { return words_.size(); }
+    vector<int32_t> features_;
+    int size() { return features_.size(); }
 };
 vector<Sentence *> docs;
 
@@ -63,6 +66,7 @@ long long category_size = 0, category_max_size = 1000;
 char ctrl_a = 1;  // Character ctrl-a
 int epoch = 5;  // iteration number
 real MIN_LR = 0.000001;
+int ngram = 2;
 
 //----------------------------------------------------
 void InitUnigramTable() {
@@ -81,7 +85,7 @@ void Split(const string &s, const char *delims, vector<string> &res) {
 }
 
 void ReadLabelInstance(const string &text, Sentence *sen) {
-    int idx = text.find('');
+    int idx = text.find('\001');
     string label = text.substr(0, idx);
     string words = text.substr(idx+1);
     Split(words, " ", sen->words_);
@@ -235,7 +239,7 @@ void ReduceCategory() {
 // Create binary Huffman tree using the category counts
 // Frequent category will have short unique binary codes.
 void CreateBinaryTree() {
-  long long a, b, i, min1i, min2i, pos1, pos2, point[MAX_CODE_LENGTH];
+  long long a, b, i, mini[2], pos1, pos2, point[MAX_CODE_LENGTH];
   char code[MAX_CODE_LENGTH];
   long long *count = (long long *) calloc(category_size * 2 + 1, sizeof(long long));
   long long *binary = (long long *) calloc(category_size * 2 + 1, sizeof(long long));
@@ -246,35 +250,20 @@ void CreateBinaryTree() {
   pos2 = category_size;
   // Constructs the huffman tree by adding one node at a time.
   for (a = 0; a < category_size - 1; a++) {
-    // First, find two smallest nodes 'min1, min2'
-    if (pos1 >= 0) {
-      if (count[pos1] < count[pos2]) {
-        min1i = pos1;
-        pos1--;
-      } else {
-        min1i = pos2;
-        pos2++;
-      }
-    } else {
-      min1i = pos2;
-      pos2++;
+    // Find two smallest nodes 'min1, min2'
+    for (b = 0; b < 2; b++) {
+        if (pos1 >= 0 && (count[pos1] < count[pos2]) ) {
+            mini[b] = pos1;
+            pos1--;
+        } else {
+            mini[b] = pos2;
+            pos2++;
+        }
     }
-    if (pos1 >= 0) {
-      if (count[pos1] < count[pos2]) {
-        min2i = pos1;
-        pos1--;
-      } else {
-        min2i = pos2;
-        pos2++;
-      }
-    } else {
-      min2i = pos2;
-      pos2++;
-    }
-    count[category_size + a] = count[min1i] + count[min2i];
-    parent_node[min1i] = category_size + a;
-    parent_node[min2i] = category_size + a;
-    binary[min2i] = 1; // right child set to 1.
+    count[category_size + a] = count[mini[0]] + count[mini[0]];
+    parent_node[mini[0]] = category_size + a;
+    parent_node[mini[1]] = category_size + a;
+    binary[mini[1]] = 1; // right child set to 1.
   }
   // Now assign binary code to each vocabulary word.
   for (a = 0; a < category_size; a++) {
@@ -300,9 +289,19 @@ void CreateBinaryTree() {
   free(parent_node);
 }
 
+void AddNGrams(Sentence *sen, int32_t ngram) {
+    for (size_t i = 0; i < sen->words_.size() - ngram + 1; ++i) {
+        string gram = "<-";
+        for (int j = 0; j < ngram; ++j) {
+            gram += sen->words_[i+j] + "-";
+        }
+        gram += ">";
+        sen->ngrams_.push_back(gram);
+    }
+}
+
 void LearnVocabFromTrainFile() {
-    long long word_idx, label_idx;
-    long long a;
+    long long a, label_idx;
     // Initialize vocab hash table.
     for (a = 0; a < vocab_hash_size; a++) vocab_hash[a] = -1;
     for (a = 0; a < category_hash_size; a++) category_hash[a] = -1;
@@ -317,6 +316,7 @@ void LearnVocabFromTrainFile() {
     while (getline(fin, line)) {
         Sentence *sen = new Sentence();
         ReadLabelInstance(line, sen);
+        AddNGrams(sen, ngram);
         label_idx = SearchLabel(sen->label_.c_str());
         if (label_idx == -1) {  // New label
             a = AddNewLabel(sen->label_.c_str());
@@ -328,8 +328,16 @@ void LearnVocabFromTrainFile() {
         for (size_t i = 0; i < sen->words_.size(); ++i) {
             int wid = SearchVocab(sen->words_[i].c_str());
             if (wid == -1) { // New word
-                AddWordToVocab(sen->words_[i].c_str());
+                wid = AddWordToVocab(sen->words_[i].c_str());
             }
+            sen->features_.push_back(wid);
+        }
+        for (size_t i = 0; i < sen->ngrams_.size(); ++i) {
+            int wid = SearchVocab(sen->ngrams_[i].c_str());
+            if (wid == -1) {
+                wid = AddWordToVocab(sen->ngrams_[i].c_str());
+            }
+            sen->features_.push_back(wid);
         }
 
         docs.push_back(sen);
@@ -339,24 +347,17 @@ void LearnVocabFromTrainFile() {
 
     if (debug_mode > 0) {
         fprintf(stderr, "Category size: %lld\n", category_size);
-        fprintf(stderr, "Read [%lld] Sentences\n", docs.size());
-        fprintf(stderr, "Vocab contains [%lld] words\n", vocab_size);
+        fprintf(stderr, "Read [%d] Sentences\n", docs.size());
+        fprintf(stderr, "Vocab contains [%lld] tokens\n", vocab_size);
     }
 
     fin.close();
 }
 
 void SaveVocab() {
-    /*long long i;
-    FILE *fo = fopen(save_vocab_file, "wb");
-    for (i = 0; i < vocab_hash_size; i++) {
-        fprintf(fo, "%s %lld\n", vocab[i].word, vocab[i].cn);
-    }
-    fclose(fo);*/
 }
 
 void ReadVocab() {
-
 }
 
 void InitNet() {
@@ -404,12 +405,9 @@ void DestroyVocab() {
 }
 
 void *TrainModelThread(void *id) {
-    long long a, b, d, last_word, last_label;
-    long long word_count = 0, last_word_count = 0;
-    long long l1, l2, c, label;
-    unsigned long long next_random = (long long) id;
+    long long c, d, l2, last_word, last_label;
+    long long word_count = 0;
     real f, g; // gradient
-    clock_t now;
 
     // neu1 is hidden units, neu1e is hidden resual error.
     real *neu1 = (real *) calloc(layer1_size, sizeof(real));
@@ -418,24 +416,24 @@ void *TrainModelThread(void *id) {
     long long ntokens = 0;
     for (size_t i = 0; i < docs.size(); ++i) ntokens += docs[i]->size();
 
-    // long long part_begin = (long long) num_threads * (long long) id;
-
-    for (size_t iter = 0; iter < epoch; ++iter) {
+    for (int iter = 0; iter < epoch; ++iter) {
         for (size_t i = 0; i < docs.size(); ++i) {
             Sentence *sen = docs[i];
             word_count += sen->size();
-            if (word_count % 100000 == 0) { // decay learning rate.
+
+            if (word_count % 10000 == 0) { // decay learning rate.
                 real progress = (real) word_count / (ntokens * epoch);
-                alpha = alpha * (1.0 - progress);
+                alpha = starting_alpha * (1.0 - progress);
                 if (alpha < MIN_LR) alpha = MIN_LR;
-                fprintf(stderr, "processed %lld words, lr:%.6f\n", word_count, alpha);
+                fprintf(stderr, "process: %.2f%%, lr:%.6f\r", (progress * 100), alpha);
             }
             for (c = 0; c < layer1_size; c++) neu1[c] = 0;
             for (c = 0; c < layer1_size; c++) neu1e[c] = 0;
 
             int total = 0;
-            for (size_t j = 0; j < sen->words_.size(); ++j) {
-                last_word = SearchVocab(sen->words_[j].c_str());
+            for (int j = 0; j < sen->size(); ++j) {
+                // last_word = SearchVocab(sen->words_[j].c_str());
+                last_word = sen->features_[j];
                 if (last_word != -1) {
                     total++;
                     for (c = 0; c < layer1_size; c++) {
@@ -478,8 +476,9 @@ void *TrainModelThread(void *id) {
             for (c = 0; c < layer1_size; c++) neu1e[c] /= total;
 
             // Hidden -> input
-            for (size_t j = 0; j < sen->words_.size(); ++j) {
-                last_word = SearchVocab(sen->words_[j].c_str());
+            for (int j = 0; j < sen->size(); ++j) {
+                // last_word = SearchVocab(sen->words_[j].c_str());
+                last_word = sen->features_[j];
                 if (last_word == -1) continue;
                 for (c = 0; c < layer1_size; c++) {
                     syn0[c + last_word * layer1_size] += neu1e[c];
@@ -493,7 +492,7 @@ void *TrainModelThread(void *id) {
 }
 
 void TrainModel() {
-    long a, b, c, d;
+    long a, b;
     FILE *fo;
     pthread_t *pt = (pthread_t *) malloc(num_threads * sizeof(pthread_t));
     if (pt == NULL) {
@@ -521,6 +520,9 @@ void TrainModel() {
     for (a = 0; a < num_threads; a++) {
         pthread_join(pt[a], NULL);
     }
+    fflush(stdout);
+    fprintf(stdout, "Training time %lds\n", (long)((clock() - start + 1)/(real)CLOCKS_PER_SEC));
+
     fo = fopen(output_file, "wb");
     if (fo == NULL) {
         fprintf(stderr, "Open %s failed.\n", output_file);
@@ -593,7 +595,7 @@ int ArgPos(const char *str, int argc, char **argv) {
 }
 
 void Usage() {
-    printf("WORD VECTOR estimation toolkit v 0.1b\n\n");
+    printf("multicategory classification toolkit v 0.1b\n\n");
     printf("Options:\n");
     printf("Parameters for training:\n");
     printf("\t-train <file>\n");
@@ -612,17 +614,8 @@ void Usage() {
     printf("\t\tThis will discard words that appear less than <int> times; default is 5\n");
     printf("\t-alpha <float>\n");
     printf("\t\tSet the starting learning rate; default is 0.025\n");
-    printf("\t-debug <int>\n");
-    printf("\t\tSet the debug mode (default = 2 = more info during training)\n");
-    printf("\t-binary <int>\n");
-    printf("\t\tSave the resulting vectors in binary moded; default is0 (off)\n");
-    printf("\t-save-vocab <file>\n");
-    printf("\t\tThe vocabulary will be saved to <file>\n");
-    printf("\t-read-vocab <file>\n");
-    printf("\t\tThe vocabulary will be read from <file>, not constructed from the training data\n");
     printf("\nExamples:\n");
-    printf("./word2vec -train data.txt -output vec.txt -debug 2 -size 200 "
-                   "-window 5 -sample 1e-4 -negative 5 -hs 0 -binary 0 -cbow 1\n\n");
+    printf("./doc2label -train data.txt -output model -size 10 \n\n");
 }
 
 int main(int argc, char **argv) {
@@ -639,6 +632,8 @@ int main(int argc, char **argv) {
     if ((i = ArgPos("-train", argc, argv)) > 0) strcpy(train_file, argv[i + 1]);
     if ((i = ArgPos("-output", argc, argv)) > 0) strcpy(output_file, argv[i + 1]);
     if ((i = ArgPos("-threads", argc, argv)) > 0) num_threads = atoi(argv[i + 1]);
+
+    starting_alpha = alpha;
 
     vocab = (struct vocab_word *) calloc(vocab_max_size, sizeof(struct vocab_word));
     vocab_hash = (int *) calloc(vocab_hash_size, sizeof(int));
